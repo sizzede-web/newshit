@@ -47,3 +47,6 @@ next-env.d.ts
 
 # Local temp files
 temp/
+
+# Social Manager: gespeicherte Browser-Anmeldung (Cookies!)
+.social-profile/

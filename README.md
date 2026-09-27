@@ -1,3 +1,5 @@
+> **brandlo.de Social Manager** (Instagram & TikTok: wer folgt nicht zurück, entfolgen, Accounts automatisch folgen): siehe [docs/SOCIAL_MANAGER.md](docs/SOCIAL_MANAGER.md).
+
 <div align="center">
 
 # AI Website Cloner Template
