@@ -1,6 +1,6 @@
 import type { Page } from "playwright";
 import type { ActionOutcome, ListType, SessionInfo, SocialUser } from "@/types/social";
-import { HOME_URLS, jitter, withPage } from "./browser";
+import { HOME_URLS, jitter, sleep, withPage } from "./browser";
 import { SocialError } from "./errors";
 
 // App-ID, die instagram.com im Browser selbst mitschickt.
@@ -67,6 +67,13 @@ async function igFetch<T>(
     { path, form, appId: IG_APP_ID },
   );
 
+  if (result.status === 429) {
+    throw new SocialError(
+      "Instagram bremst gerade (zu viele Anfragen, HTTP 429). Bitte 15–30 Minuten warten und dann erneut versuchen.",
+      { blocked: true, status: 429 },
+    );
+  }
+
   let json: Record<string, unknown> = {};
   try {
     json = JSON.parse(result.text) as Record<string, unknown>;
@@ -107,21 +114,38 @@ async function myUserId(page: Page): Promise<string | undefined> {
   return cookies.find((c) => c.name === "ds_user_id")?.value;
 }
 
+interface IgProfileInfo extends IgRawUser {
+  edge_followed_by?: { count?: number };
+  edge_follow?: { count?: number };
+}
+
+/** Eigener Account über den Endpunkt, den auch die Profil-Bearbeiten-Seite nutzt. */
+async function currentUser(page: Page, id: string): Promise<SocialUser> {
+  const data = await igFetch<{ user?: IgRawUser }>(page, "/api/v1/accounts/current_user/?edit=true");
+  if (!data.user?.username) {
+    throw new SocialError("Instagram-Account konnte nicht ermittelt werden.", { status: 502 });
+  }
+  return { ...toUser(data.user), id };
+}
+
 export function getSession(): Promise<SessionInfo> {
   return withPage("instagram", async (page) => {
     const id = await myUserId(page);
     if (!id) return { platform: "instagram", loggedIn: false };
-    const data = await igFetch<{
-      user: IgRawUser & { follower_count?: number; following_count?: number };
-    }>(page, `/api/v1/users/${id}/info/`);
+    const me = await currentUser(page, id);
+    // Zahlen sind nur Zusatzinfo – wenn Instagram hier bremst, trotzdem als eingeloggt anzeigen.
+    const profile = await igFetch<{ data?: { user?: IgProfileInfo | null } }>(
+      page,
+      `/api/v1/users/web_profile_info/?username=${encodeURIComponent(me.username)}`,
+    ).catch(() => null);
+    const info = profile?.data?.user;
     return {
       platform: "instagram",
       loggedIn: true,
       user: {
-        ...toUser(data.user),
-        id,
-        followerCount: data.user.follower_count,
-        followingCount: data.user.following_count,
+        ...me,
+        followerCount: info?.edge_followed_by?.count,
+        followingCount: info?.edge_follow?.count,
       },
     };
   });
@@ -143,6 +167,26 @@ async function lookupUser(page: Page, username: string): Promise<SocialUser> {
   return toUser(user);
 }
 
+interface IgListPage {
+  users?: IgRawUser[];
+  next_max_id?: string | number | null;
+}
+
+const LIST_RETRY_WAITS_MS = [60_000, 180_000];
+
+/** Beim Laden langer Listen bremst Instagram öfter kurz – dann warten und nochmal versuchen. */
+async function fetchPageWithRetry(page: Page, path: string): Promise<IgListPage> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await igFetch<IgListPage>(page, path);
+    } catch (error) {
+      const wait = LIST_RETRY_WAITS_MS[attempt];
+      if (!(error instanceof SocialError) || error.status !== 429 || wait === undefined) throw error;
+      await sleep(wait);
+    }
+  }
+}
+
 async function fetchList(
   page: Page,
   userId: string,
@@ -155,7 +199,7 @@ async function fetchList(
     const params = new URLSearchParams({ count: String(PAGE_SIZE) });
     if (type === "followers") params.set("search_surface", "follow_list_page");
     if (maxId) params.set("max_id", maxId);
-    const data = await igFetch<{ users?: IgRawUser[]; next_max_id?: string | number | null }>(
+    const data = await fetchPageWithRetry(
       page,
       `/api/v1/friendships/${userId}/${type}/?${params.toString()}`,
     );
@@ -165,7 +209,7 @@ async function fetchList(
     }
     maxId = data.next_max_id != null ? String(data.next_max_id) : undefined;
     // Kleine Pause zwischen den Seiten, damit es nicht wie ein Bot aussieht.
-    if (maxId) await jitter(1200, 2500);
+    if (maxId) await jitter(2500, 4500);
   } while (maxId && users.size < limit);
   return [...users.values()].slice(0, limit);
 }
@@ -177,10 +221,10 @@ export function getMyRelations(): Promise<{
 }> {
   return withPage("instagram", async (page) => {
     const id = await requireMe(page);
-    const info = await igFetch<{ user: IgRawUser }>(page, `/api/v1/users/${id}/info/`);
+    const me = await currentUser(page, id);
     const following = await fetchList(page, id, "following", Number.POSITIVE_INFINITY);
     const followers = await fetchList(page, id, "followers", Number.POSITIVE_INFINITY);
-    return { me: { ...toUser(info.user), id }, followers, following };
+    return { me, followers, following };
   });
 }
 
