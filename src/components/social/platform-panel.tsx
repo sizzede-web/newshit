@@ -248,7 +248,9 @@ export function PlatformPanel({ platform }: { platform: Platform }) {
                 />
               )}
               <div>
-                <p className="font-medium">@{session.user.username}</p>
+                <p className="font-medium">
+                  {session.user.username ? `@${session.user.username}` : "Eingeloggt"}
+                </p>
                 <p className="text-sm text-muted-foreground tabular-nums">
                   {session.user.followerCount ?? "–"} Follower · {session.user.followingCount ?? "–"}{" "}
                   Gefolgt

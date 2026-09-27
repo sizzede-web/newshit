@@ -21,6 +21,7 @@ interface IgRawUser {
 interface IgFetchResult {
   status: number;
   text: string;
+  url: string;
 }
 
 function toUser(raw: IgRawUser): SocialUser {
@@ -62,7 +63,7 @@ async function igFetch<T>(
         headers,
         body: form ? new URLSearchParams(form).toString() : undefined,
       });
-      return { status: res.status, text: await res.text() };
+      return { status: res.status, text: await res.text(), url: res.url };
     },
     { path, form, appId: IG_APP_ID },
   );
@@ -78,9 +79,18 @@ async function igFetch<T>(
   try {
     json = JSON.parse(result.text) as Record<string, unknown>;
   } catch {
+    if (/\/(challenge|checkpoint)\//.test(result.url)) {
+      throw new SocialError(
+        "Instagram verlangt eine Sicherheitsbestätigung. Bitte im Instagram-Chrome-Fenster erledigen und erneut versuchen.",
+        { status: 403 },
+      );
+    }
+    if (result.url.includes("/accounts/login")) {
+      throw new SocialError("Nicht bei Instagram eingeloggt.", { status: 401 });
+    }
     if (result.status >= 400 || result.text.trimStart().startsWith("<")) {
       throw new SocialError(
-        `Instagram hat keine gültige Antwort geliefert (HTTP ${result.status}). Bist du eingeloggt?`,
+        `Instagram hat keine Daten geliefert (HTTP ${result.status}, ${new URL(result.url).pathname}).`,
         { status: 502 },
       );
     }
@@ -119,13 +129,42 @@ interface IgProfileInfo extends IgRawUser {
   edge_follow?: { count?: number };
 }
 
-/** Eigener Account über den Endpunkt, den auch die Profil-Bearbeiten-Seite nutzt. */
+/**
+ * Eigener Account. Für die Listen reicht die ID aus dem Cookie – Name und Bild
+ * versuchen wir über mehrere Wege zu bekommen, weil Instagram einzelne davon gerne sperrt.
+ */
 async function currentUser(page: Page, id: string): Promise<SocialUser> {
-  const data = await igFetch<{ user?: IgRawUser }>(page, "/api/v1/accounts/current_user/?edit=true");
-  if (!data.user?.username) {
-    throw new SocialError("Instagram-Account konnte nicht ermittelt werden.", { status: 502 });
+  const fallback: SocialUser = { id, username: "", fullName: "", avatarUrl: "" };
+
+  const form = await igFetch<{ form_data?: { username?: string; first_name?: string } }>(
+    page,
+    "/api/v1/accounts/edit/web_form_data/",
+  ).catch(() => null);
+  let username = form?.form_data?.username ?? "";
+  if (form?.form_data?.first_name) fallback.fullName = form.form_data.first_name;
+
+  if (!username) {
+    const info = await igFetch<{ user?: IgRawUser }>(page, `/api/v1/users/${id}/info/`).catch(
+      () => null,
+    );
+    if (info?.user?.username) return { ...toUser(info.user), id };
   }
-  return { ...toUser(data.user), id };
+
+  if (!username) {
+    // Letzter Versuch: Profil-Link in der Seitenleiste von instagram.com
+    await page.goto(HOME_URLS.instagram, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+    username = await page
+      .evaluate(() => {
+        const links = [...document.querySelectorAll<HTMLAnchorElement>('a[href^="/"]')];
+        const profile = links.find((a) => /^(profil|profile)$/i.test(a.innerText.trim()));
+        return profile?.getAttribute("href")?.replace(/\//g, "") ?? "";
+      })
+      .catch(() => "");
+  }
+
+  if (!username) return fallback;
+  const profile = await lookupUser(page, username).catch(() => null);
+  return profile ? { ...profile, id } : { ...fallback, username };
 }
 
 export function getSession(): Promise<SessionInfo> {
@@ -134,10 +173,12 @@ export function getSession(): Promise<SessionInfo> {
     if (!id) return { platform: "instagram", loggedIn: false };
     const me = await currentUser(page, id);
     // Zahlen sind nur Zusatzinfo – wenn Instagram hier bremst, trotzdem als eingeloggt anzeigen.
-    const profile = await igFetch<{ data?: { user?: IgProfileInfo | null } }>(
-      page,
-      `/api/v1/users/web_profile_info/?username=${encodeURIComponent(me.username)}`,
-    ).catch(() => null);
+    const profile = me.username
+      ? await igFetch<{ data?: { user?: IgProfileInfo | null } }>(
+          page,
+          `/api/v1/users/web_profile_info/?username=${encodeURIComponent(me.username)}`,
+        ).catch(() => null)
+      : null;
     const info = profile?.data?.user;
     return {
       platform: "instagram",
